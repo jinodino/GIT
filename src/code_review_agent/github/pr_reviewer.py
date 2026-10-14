@@ -9,7 +9,7 @@ from pathlib import Path
 
 from openai import OpenAIError
 
-from code_review_agent.agent.reviewer import CodeReviewAgent
+from code_review_agent.agent.reviewer import CodeReviewAgent, ReviewTrace
 from code_review_agent.tools.file_reader import read_file
 
 API_ROOT = "https://api.github.com"
@@ -101,14 +101,25 @@ class GitHubClient:
         return self.request("POST", f"{self.base}/issues/{number}/comments", {"body": body})
 
 
-def review_files(paths: list[str], project_root: Path, agent: CodeReviewAgent) -> str:
+def review_files(
+    paths: list[str], project_root: Path, agent: CodeReviewAgent, reflection_rounds: int = 1
+) -> str:
     sections = [MARKER, "## AI Code Review"]
     for path in paths:
         # Paths and review text originate in an untrusted PR. Keep them as data.
         title = path.replace("\n", " ").replace("\r", " ").replace("`", "'")
         try:
             read_file(str(project_root), path)
-            result = agent.review(path, max_iterations=5)
+            result = agent.review(
+                path, max_iterations=5, reflection_rounds=reflection_rounds
+            )
+            trace = agent.last_review_trace
+            if isinstance(trace, ReviewTrace) and trace.feedback:
+                details = ["<details><summary>리뷰 개선 과정</summary>", "**초안**", trace.draft]
+                for number, feedback in enumerate(trace.feedback, start=1):
+                    details.extend([f"**자기 비판 {number}회차**", feedback])
+                details.append("</details>")
+                result += "\n\n" + "\n\n".join(details)
         except (OSError, UnicodeError, ValueError, RuntimeError, OpenAIError) as error:
             # Never publish exception details or secrets.
             result = f"리뷰 실패: {type(error).__name__}"
@@ -127,13 +138,18 @@ def main() -> None:
     if number < 1:
         raise ValueError("PR_NUMBER는 양수여야 합니다.")
     project_root = Path(os.environ["PROJECT_ROOT"]).resolve()
+    reflection_rounds = int(os.environ.get("REFLECTION_ROUNDS", "1"))
+    if not 0 <= reflection_rounds <= 3:
+        raise ValueError("REFLECTION_ROUNDS는 0~3이어야 합니다.")
     github = GitHubClient(os.environ["GITHUB_TOKEN"], repository)
     paths = github.changed_python_files(number)
     if not paths:
         print("변경된 Python 파일이 없습니다.")
         return
     agent = CodeReviewAgent(project_root=str(project_root))
-    github.upsert_comment(number, review_files(paths, project_root, agent))
+    github.upsert_comment(
+        number, review_files(paths, project_root, agent, reflection_rounds)
+    )
     print(f"Python 파일 {len(paths)}개 리뷰 댓글을 등록하거나 갱신했습니다.")
 
 

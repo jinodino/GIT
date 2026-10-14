@@ -6,6 +6,7 @@ from urllib.error import HTTPError, URLError
 
 import pytest
 
+from code_review_agent.agent.reviewer import ReviewTrace
 from code_review_agent.github import pr_reviewer
 from code_review_agent.github.pr_reviewer import (
     MARKER,
@@ -70,6 +71,21 @@ def test_review_files_combines_and_continues(tmp_path: Path):
     assert "secret detail" not in body
     assert agent.review.call_count == 2
     assert agent.review.call_args_list[0].kwargs["max_iterations"] == 5
+    assert agent.review.call_args_list[0].kwargs["reflection_rounds"] == 1
+
+
+def test_review_files_shows_reflection_trace(tmp_path: Path):
+    (tmp_path / "a.py").write_text("x = 1\n")
+    agent = Mock()
+    agent.review.return_value = "최종 리뷰"
+    agent.last_review_trace = ReviewTrace("초안", ("근거를 보강하세요",), "최종 리뷰")
+
+    body = review_files(["a.py"], tmp_path, agent)
+
+    assert "최종 리뷰" in body
+    assert "<summary>리뷰 개선 과정</summary>" in body
+    assert "초안" in body
+    assert "근거를 보강하세요" in body
 
 
 def test_comment_updates_only_own_marked_comment():

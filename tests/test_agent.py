@@ -46,6 +46,7 @@ def test_agent_loop():
     result = agent.review(
         file_name="calculator.py",
         max_iterations=3,
+        reflection_rounds=0,
     )
 
     assert result == "미사용 import가 있습니다."
@@ -56,3 +57,45 @@ def test_agent_loop():
 
     assert second_call.kwargs["previous_response_id"] == "response_1"
     assert second_call.kwargs["input"][0]["type"] == "function_call_output"
+
+
+def test_reflection_creates_feedback_and_final_review():
+    project_root = Path(__file__).resolve().parents[1] / "sample_project"
+    responses = [
+        SimpleNamespace(id="tool", output=[SimpleNamespace(
+            type="function_call", name="read_file",
+            arguments='{"file_path":"calculator.py"}', call_id="call_1"
+        )], output_text=""),
+        SimpleNamespace(id="draft", output=[], output_text="초안"),
+        SimpleNamespace(id="critique", output=[], output_text="근거를 보강하세요"),
+        SimpleNamespace(id="final", output=[], output_text="수정된 리뷰"),
+    ]
+    client = Mock()
+    client.responses.create.side_effect = responses
+    agent = CodeReviewAgent(str(project_root), client=client)
+
+    assert agent.review("calculator.py") == "수정된 리뷰"
+    assert client.responses.create.call_count == 4
+    assert client.responses.create.call_args_list[2].kwargs["previous_response_id"] == "draft"
+    assert client.responses.create.call_args_list[3].kwargs["previous_response_id"] == "critique"
+    assert agent.last_review_trace.draft == "초안"
+    assert agent.last_review_trace.feedback == ("근거를 보강하세요",)
+    assert agent.last_review_trace.final == "수정된 리뷰"
+
+
+def test_reflection_rounds_are_configurable():
+    project_root = Path(__file__).resolve().parents[1] / "sample_project"
+    outputs = [
+        SimpleNamespace(id="draft", output=[], output_text="초안"),
+        SimpleNamespace(id="c1", output=[], output_text="피드백1"),
+        SimpleNamespace(id="r1", output=[], output_text="수정1"),
+        SimpleNamespace(id="c2", output=[], output_text="피드백2"),
+        SimpleNamespace(id="r2", output=[], output_text="수정2"),
+    ]
+    client = Mock()
+    client.responses.create.side_effect = outputs
+    agent = CodeReviewAgent(str(project_root), client=client)
+
+    assert agent.review("calculator.py", reflection_rounds=2) == "수정2"
+    assert agent.last_review_trace.feedback == ("피드백1", "피드백2")
+    assert client.responses.create.call_count == 5

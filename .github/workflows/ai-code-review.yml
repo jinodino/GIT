@@ -43,4 +43,5 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PROJECT_ROOT: ${{ github.workspace }}/pr-files
           PYTHONPATH: ${{ github.workspace }}/trusted-agent/src
+          REFLECTION_ROUNDS: ${{ vars.REFLECTION_ROUNDS || '1' }}
         run: python -m code_review_agent.github.pr_reviewer
