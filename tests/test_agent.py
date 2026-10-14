@@ -99,3 +99,20 @@ def test_reflection_rounds_are_configurable():
     assert agent.review("calculator.py", reflection_rounds=2) == "수정2"
     assert agent.last_review_trace.feedback == ("피드백1", "피드백2")
     assert client.responses.create.call_count == 5
+
+
+def test_suggest_changes_uses_review_and_changed_lines():
+    project_root = Path(__file__).resolve().parents[1] / "sample_project"
+    client = Mock()
+    client.responses.create.return_value = SimpleNamespace(
+        output_text='{"suggestions":[{"line":2,"original":"x = 1",'
+        '"replacement":"x = 2","reason":"개선"}]}'
+    )
+    agent = CodeReviewAgent(str(project_root), client=client)
+    assert agent.suggest_changes("calculator.py", "검토 결과", {2: "x = 1"})[0]["line"] == 2
+    call = client.responses.create.call_args.kwargs
+    assert "검토 결과" in call["input"]
+    assert call["tool_choice"] == "none"
+    client.responses.create.reset_mock()
+    assert agent.suggest_changes("calculator.py", "검토 결과", {}) == []
+    client.responses.create.assert_not_called()
