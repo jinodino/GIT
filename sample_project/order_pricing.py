@@ -33,5 +33,5 @@ def calculate_order_total(
         (item.unit_price * item.quantity for item in items),
         start=Decimal(0),
     )
-    total = subtotal * (Decimal(1) - discount_rate)
+    total = subtotal * (Decimal(1) + discount_rate)
     return total.quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
