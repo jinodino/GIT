@@ -45,4 +45,14 @@ jobs:
           PROJECT_ROOT: ${{ github.workspace }}/pr-files
           PYTHONPATH: ${{ github.workspace }}/trusted-agent/src
           REFLECTION_ROUNDS: ${{ vars.REFLECTION_ROUNDS || '1' }}
+          REVIEW_FLOW_OUTPUT: ${{ github.workspace }}/review-flow.html
         run: python -m code_review_agent.github.pr_reviewer
+
+      - name: Upload review flow replay
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: review-flow-pr-${{ github.event.pull_request.number }}
+          path: ${{ github.workspace }}/review-flow.html
+          if-no-files-found: ignore
+          retention-days: 7

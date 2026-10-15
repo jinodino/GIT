@@ -1,0 +1,141 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>AI Code Review 실행 흐름</title>
+  <style>
+    :root { color-scheme: light dark; font-family: system-ui, sans-serif; }
+    * { box-sizing: border-box; }
+    body { max-width: 1180px; margin: 0 auto; padding: 24px; background: light-dark(#f7f8fb, #151923); color: light-dark(#172033, #edf1f7); }
+    h1 { font-size: 1.5rem; margin: 0 0 6px; }
+    h2 { font-size: 1.1rem; margin: 0; }
+    p { line-height: 1.5; }
+    .subtle { color: light-dark(#53627a, #abb7ca); }
+    .controls { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 20px 0; }
+    button, select { font: inherit; padding: 9px 13px; border: 1px solid light-dark(#c8d0de, #4a566b); border-radius: 8px; background: light-dark(#fff, #252d3c); color: inherit; }
+    button { cursor: pointer; }
+    button:disabled { opacity: .45; cursor: default; }
+    button:focus-visible, select:focus-visible { outline: 2px solid #4a83e6; outline-offset: 2px; }
+    #play { background: #315fd2; border-color: #315fd2; color: #fff; }
+    .counter { margin-left: auto; font-variant-numeric: tabular-nums; }
+    .layout { display: grid; grid-template-columns: minmax(240px, 340px) minmax(0, 1fr); gap: 20px; }
+    .actors { display: flex; flex-wrap: wrap; gap: 8px; margin: 0 0 20px; }
+    .actor { padding: 8px 11px; border: 1px solid light-dark(#c8d0de, #4a566b); border-radius: 8px; background: light-dark(#fff, #252d3c); }
+    .actor.active { border-color: #5689eb; background: light-dark(#dfe9ff, #253b67); font-weight: 700; }
+    .timeline { display: grid; gap: 4px; align-content: start; max-height: 680px; overflow-y: auto; }
+    .event { text-align: left; width: 100%; display: grid; grid-template-columns: 34px 1fr; gap: 8px; align-items: center; border: 0; background: transparent; }
+    .event[aria-current="step"] { background: light-dark(#dfe9ff, #253b67); }
+    .number { color: light-dark(#64738c, #b1bed3); font-variant-numeric: tabular-nums; }
+    .panel { border: 1px solid light-dark(#d4dbe6, #3e4a5f); border-radius: 12px; background: light-dark(#fff, #202838); padding: 20px; min-width: 0; }
+    .route { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; margin: 16px 0; font-weight: 600; }
+    .route span { background: light-dark(#eaf0fa, #31405a); padding: 6px 10px; border-radius: 7px; }
+    .route b { color: #5689eb; }
+    .label { font-size: .82rem; font-weight: 600; color: light-dark(#53627a, #abb7ca); margin: 18px 0 6px; }
+    pre { margin: 0; padding: 12px; white-space: pre-wrap; overflow-wrap: anywhere; border-radius: 8px; background: light-dark(#f0f3f8, #151d2b); line-height: 1.5; font-size: .92rem; }
+    #process { margin: 0; }
+    @media (max-width: 720px) { body { padding: 16px; } .layout { grid-template-columns: 1fr; } .timeline { grid-template-columns: repeat(2, minmax(0, 1fr)); max-height: 240px; } .counter { margin-left: 0; } }
+  </style>
+</head>
+<body>
+  <h1>AI Code Review 실행 흐름</h1>
+  <p class="subtle">GitHub Actions 실행 중 기록한 실제 단계입니다. 코드를 실행하거나 GitHub에 연결하지 않는 오프라인 재생 화면입니다.</p>
+  <div class="controls">
+    <button id="play" type="button">일시정지</button>
+    <button id="previous" type="button">이전</button>
+    <button id="next" type="button">다음</button>
+    <label for="speed">재생 속도</label>
+    <select id="speed"><option value="2400">느리게</option><option value="1500" selected>보통</option><option value="750">빠르게</option></select>
+    <span id="counter" class="counter subtle" aria-live="polite"></span>
+  </div>
+  <div id="actors" class="actors" aria-label="실행 참여자"></div>
+  <div class="layout">
+    <nav id="timeline" class="timeline" aria-label="실행 순서"></nav>
+    <main class="panel" aria-live="polite">
+      <h2 id="title"></h2>
+      <div class="route"><span id="source"></span><b aria-hidden="true">→</b><span id="target"></span></div>
+      <div class="label">입력값</div><pre id="input"></pre>
+      <div class="label">처리</div><p id="process"></p>
+      <div class="label">다음 단계로 전달된 값</div><pre id="output"></pre>
+    </main>
+  </div>
+  <script id="trace-data" type="application/json">__TRACE_EVENTS_JSON__</script>
+  <script>
+    (() => {
+      const events = JSON.parse(document.getElementById('trace-data').textContent);
+      const timeline = document.getElementById('timeline');
+      const playButton = document.getElementById('play');
+      const speed = document.getElementById('speed');
+      const actors = document.getElementById('actors');
+      const participants = [...new Set(events.flatMap(event => [event.source, event.target]))];
+      participants.forEach(name => {
+        const node = document.createElement('span');
+        node.className = 'actor';
+        node.textContent = name;
+        actors.appendChild(node);
+      });
+      let index = 0;
+      let timer = null;
+      let playing = events.length > 1;
+      function show(position) {
+        if (!events.length) {
+          document.getElementById('title').textContent = '기록된 단계가 없습니다.';
+          document.getElementById('counter').textContent = '0 / 0';
+          return;
+        }
+        index = Math.max(0, Math.min(position, events.length - 1));
+        const event = events[index];
+        [...actors.children].forEach((node, n) => {
+          node.classList.toggle('active', participants[n] === event.source || participants[n] === event.target);
+        });
+        for (const name of ['title', 'source', 'target', 'input', 'output', 'process']) {
+          document.getElementById(name).textContent = event[name];
+        }
+        document.getElementById('counter').textContent = `${index + 1} / ${events.length}`;
+        [...timeline.children].forEach((node, n) => {
+          if (n === index) node.setAttribute('aria-current', 'step');
+          else node.removeAttribute('aria-current');
+        });
+        document.getElementById('previous').disabled = index === 0;
+        document.getElementById('next').disabled = index === events.length - 1;
+      }
+      function stop() {
+        clearInterval(timer);
+        timer = null;
+        playing = false;
+        playButton.textContent = '재생';
+      }
+      function start() {
+        if (events.length < 2) return;
+        if (index === events.length - 1) show(0);
+        clearInterval(timer);
+        playing = true;
+        playButton.textContent = '일시정지';
+        timer = setInterval(() => {
+          if (index === events.length - 1) { stop(); return; }
+          show(index + 1);
+        }, Number(speed.value));
+      }
+      events.forEach((event, n) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'event';
+        const number = document.createElement('span');
+        number.className = 'number';
+        number.textContent = String(event.step).padStart(2, '0');
+        const title = document.createElement('span');
+        title.textContent = event.title;
+        button.append(number, title);
+        button.addEventListener('click', () => { stop(); show(n); });
+        timeline.appendChild(button);
+      });
+      playButton.addEventListener('click', () => playing ? stop() : start());
+      document.getElementById('previous').addEventListener('click', () => { stop(); show(index - 1); });
+      document.getElementById('next').addEventListener('click', () => { stop(); show(index + 1); });
+      speed.addEventListener('change', () => { if (playing) start(); });
+      show(0);
+      if (playing) start();
+    })();
+  </script>
+</body>
+</html>
