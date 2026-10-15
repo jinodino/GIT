@@ -9,11 +9,13 @@ from pathlib import Path
 
 from openai import OpenAIError
 
-from code_review_agent.agent.reviewer import CodeReviewAgent
+from code_review_agent.agent.reviewer import CodeReviewAgent, ReviewTrace
+from code_review_agent.github.suggestions import added_lines, validate_suggestions
 from code_review_agent.tools.file_reader import read_file
 
 API_ROOT = "https://api.github.com"
 MARKER = "<!-- code-review-agent:ai-review -->"
+SUGGESTION_MARKER = "<!-- code-review-agent:suggestion -->"
 MAX_FILES = 5
 MAX_BODY_LENGTH = 60_000
 
@@ -68,17 +70,67 @@ class GitHubClient:
                 break
             page += 1
 
-    def changed_python_files(self, number: int) -> list[str]:
+    def python_changes(self, number: int) -> list[dict]:
         files = []
         for item in self.pages(f"{self.base}/pulls/{number}/files"):
             if not isinstance(item, dict):
                 raise GitHubAPIError("변경 파일 응답 형식이 올바르지 않습니다.")
             name = item.get("filename")
             if item.get("status") != "removed" and isinstance(name, str) and name.endswith(".py"):
-                files.append(name)
+                files.append(item)
                 if len(files) == MAX_FILES:
                     break
         return files
+
+    def changed_python_files(self, number: int) -> list[str]:
+        return [item["filename"] for item in self.python_changes(number)]
+
+    def post_suggestions(self, number: int, head_sha: str, suggestions: list[dict]) -> None:
+        """Post review comments only on the current PR head, without duplicating them."""
+        if not suggestions:
+            return
+        pull = self.request("GET", f"{self.base}/pulls/{number}")
+        if not isinstance(pull, dict) or not isinstance(pull.get("head"), dict):
+            raise GitHubAPIError("PR 정보 응답 형식이 올바르지 않습니다.")
+        if pull["head"].get("sha") != head_sha:
+            print("PR에 새 커밋이 있어 수정 제안을 건너뜁니다.")
+            return
+        identity = self.request("GET", "/users/github-actions%5Bbot%5D")
+        if not isinstance(identity, dict) or not isinstance(identity.get("id"), int):
+            raise GitHubAPIError("봇 계정 정보를 확인할 수 없습니다.")
+        bot_id = identity["id"]
+        existing = {
+            (comment.get("path"), comment.get("line")): comment
+            for comment in self.pages(f"{self.base}/pulls/{number}/comments")
+            if isinstance(comment, dict)
+            and isinstance(comment.get("user"), dict)
+            and comment["user"].get("id") == bot_id
+            and comment.get("commit_id") == head_sha
+            and SUGGESTION_MARKER in comment.get("body", "")
+        }
+        for suggestion in suggestions:
+            reason = suggestion["reason"].replace("```", "'''")
+            body = (
+                f"{reason}\n\n```suggestion\n"
+                f"{suggestion['replacement']}\n```\n\n{SUGGESTION_MARKER}"
+            )
+            key = (suggestion["path"], suggestion["line"])
+            previous = existing.get(key)
+            if previous and previous.get("body") == body:
+                continue
+            if previous:
+                self.request(
+                    "PATCH", f"{self.base}/pulls/comments/{previous['id']}", {"body": body}
+                )
+                continue
+            self.request("POST", f"{self.base}/pulls/{number}/comments", {
+                "body": body,
+                "commit_id": head_sha,
+                "path": suggestion["path"],
+                "line": suggestion["line"],
+                "side": "RIGHT",
+            })
+            existing[key] = {"body": body}
 
     def upsert_comment(self, number: int, body: str):
         if len(body) > MAX_BODY_LENGTH:
@@ -101,14 +153,33 @@ class GitHubClient:
         return self.request("POST", f"{self.base}/issues/{number}/comments", {"body": body})
 
 
-def review_files(paths: list[str], project_root: Path, agent: CodeReviewAgent) -> str:
+def review_files(
+    paths: list[str], project_root: Path, agent: CodeReviewAgent, reflection_rounds: int = 1,
+    patches: dict[str, str] | None = None, suggestions: list[dict] | None = None,
+) -> str:
     sections = [MARKER, "## AI Code Review"]
     for path in paths:
         # Paths and review text originate in an untrusted PR. Keep them as data.
         title = path.replace("\n", " ").replace("\r", " ").replace("`", "'")
         try:
             read_file(str(project_root), path)
-            result = agent.review(path, max_iterations=5)
+            result = agent.review(
+                path, max_iterations=5, reflection_rounds=reflection_rounds
+            )
+            patch = (patches or {}).get(path, "")
+            if suggestions is not None and isinstance(patch, str) and patch:
+                try:
+                    proposals = agent.suggest_changes(path, result, added_lines(patch))
+                    suggestions.extend(validate_suggestions(project_root, path, patch, proposals))
+                except (OSError, UnicodeError, ValueError, TypeError, RuntimeError, OpenAIError):
+                    print(f"{title}: 수정 제안을 생성하지 못했습니다.")
+            trace = agent.last_review_trace
+            if isinstance(trace, ReviewTrace) and trace.feedback:
+                details = ["<details><summary>리뷰 개선 과정</summary>", "**초안**", trace.draft]
+                for number, feedback in enumerate(trace.feedback, start=1):
+                    details.extend([f"**자기 비판 {number}회차**", feedback])
+                details.append("</details>")
+                result += "\n\n" + "\n\n".join(details)
         except (OSError, UnicodeError, ValueError, RuntimeError, OpenAIError) as error:
             # Never publish exception details or secrets.
             result = f"리뷰 실패: {type(error).__name__}"
@@ -127,13 +198,25 @@ def main() -> None:
     if number < 1:
         raise ValueError("PR_NUMBER는 양수여야 합니다.")
     project_root = Path(os.environ["PROJECT_ROOT"]).resolve()
+    reflection_rounds = int(os.environ.get("REFLECTION_ROUNDS", "1"))
+    if not 0 <= reflection_rounds <= 3:
+        raise ValueError("REFLECTION_ROUNDS는 0~3이어야 합니다.")
     github = GitHubClient(os.environ["GITHUB_TOKEN"], repository)
-    paths = github.changed_python_files(number)
+    changes = github.python_changes(number)
+    paths = [item["filename"] for item in changes]
     if not paths:
         print("변경된 Python 파일이 없습니다.")
         return
     agent = CodeReviewAgent(project_root=str(project_root))
-    github.upsert_comment(number, review_files(paths, project_root, agent))
+    suggestions = []
+    github.upsert_comment(
+        number, review_files(
+            paths, project_root, agent, reflection_rounds,
+            {item["filename"]: item.get("patch", "") for item in changes},
+            suggestions,
+        )
+    )
+    github.post_suggestions(number, os.environ["PR_HEAD_SHA"], suggestions)
     print(f"Python 파일 {len(paths)}개 리뷰 댓글을 등록하거나 갱신했습니다.")
 
 

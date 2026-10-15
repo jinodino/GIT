@@ -41,6 +41,8 @@ jobs:
           GITHUB_TOKEN: ${{ github.token }}
           GITHUB_REPOSITORY: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
           PROJECT_ROOT: ${{ github.workspace }}/pr-files
           PYTHONPATH: ${{ github.workspace }}/trusted-agent/src
+          REFLECTION_ROUNDS: ${{ vars.REFLECTION_ROUNDS || '1' }}
         run: python -m code_review_agent.github.pr_reviewer
