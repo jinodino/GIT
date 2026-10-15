@@ -1,0 +1,89 @@
+name: Publish Review Flow
+
+on:
+  workflow_run:
+    workflows: [AI Code Review]
+    types: [completed]
+
+permissions:
+  actions: read
+  contents: read
+  pull-requests: read
+
+concurrency:
+  group: review-flow-pages
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    if: >-
+      github.event.workflow_run.conclusion == 'success' &&
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.head_repository.full_name == github.repository
+    runs-on: ubuntu-latest
+    outputs:
+      publish: ${{ steps.check.outputs.publish }}
+      artifact_name: ${{ steps.check.outputs.artifact_name }}
+    steps:
+      - name: Check the artifact and PR base
+        id: check
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { owner, repo } = context.repo;
+            const run = context.payload.workflow_run;
+            const { data } = await github.rest.actions.listWorkflowRunArtifacts({
+              owner, repo, run_id: run.id,
+            });
+            const matches = data.artifacts.filter(
+              artifact => /^review-flow-pr-\d+$/.test(artifact.name) && !artifact.expired
+            );
+            if (matches.length !== 1) return;
+            const artifact = matches[0];
+            const number = Number(artifact.name.slice('review-flow-pr-'.length));
+            const { data: pull } = await github.rest.pulls.get({ owner, repo, pull_number: number });
+            if (pull.base.ref !== context.payload.repository.default_branch) return;
+            if (pull.head.repo?.full_name !== `${owner}/${repo}`) return;
+            if (pull.head.sha !== run.head_sha) return;
+            core.setOutput('publish', 'true');
+            core.setOutput('artifact_name', artifact.name);
+
+      - name: Download the completed review trace
+        if: steps.check.outputs.publish == 'true'
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ steps.check.outputs.artifact_name }}
+          path: site
+          github-token: ${{ github.token }}
+          run-id: ${{ github.event.workflow_run.id }}
+
+      - name: Make the replay the site home page
+        if: steps.check.outputs.publish == 'true'
+        run: |
+          test -s site/review-flow.html
+          cp site/review-flow.html site/index.html
+
+      - name: Configure Pages
+        if: steps.check.outputs.publish == 'true'
+        uses: actions/configure-pages@v5
+
+      - name: Package the site
+        if: steps.check.outputs.publish == 'true'
+        uses: actions/upload-pages-artifact@v4
+        with:
+          path: site
+
+  deploy:
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      pages: write
+      id-token: write
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish the latest replay
+        id: deployment
+        uses: actions/deploy-pages@v4
