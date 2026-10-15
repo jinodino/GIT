@@ -40,6 +40,8 @@ def test_main_exits_without_python_files(monkeypatch, tmp_path):
     monkeypatch.setenv("GITHUB_TOKEN", "token")
     monkeypatch.setenv("PR_NUMBER", "1")
     monkeypatch.setenv("PROJECT_ROOT", str(tmp_path))
+    replay_path = tmp_path / "review-flow.html"
+    monkeypatch.setenv("REVIEW_FLOW_OUTPUT", str(replay_path))
     client = Mock()
     client.python_changes.return_value = []
     monkeypatch.setattr(pr_reviewer, "GitHubClient", Mock(return_value=client))
@@ -48,6 +50,7 @@ def test_main_exits_without_python_files(monkeypatch, tmp_path):
     pr_reviewer.main()
     agent.assert_not_called()
     client.upsert_comment.assert_not_called()
+    assert "변경 파일 선별" in replay_path.read_text(encoding="utf-8")
 
 
 def test_main_posts_valid_suggestion(monkeypatch, tmp_path):

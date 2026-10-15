@@ -11,6 +11,7 @@ from openai import OpenAIError
 
 from code_review_agent.agent.reviewer import CodeReviewAgent, ReviewTrace
 from code_review_agent.github.suggestions import added_lines, validate_suggestions
+from code_review_agent.replay.trace import FlowTrace
 from code_review_agent.tools.file_reader import read_file
 
 API_ROOT = "https://api.github.com"
@@ -156,6 +157,7 @@ class GitHubClient:
 def review_files(
     paths: list[str], project_root: Path, agent: CodeReviewAgent, reflection_rounds: int = 1,
     patches: dict[str, str] | None = None, suggestions: list[dict] | None = None,
+    flow_trace: FlowTrace | None = None,
 ) -> str:
     sections = [MARKER, "## AI Code Review"]
     for path in paths:
@@ -170,7 +172,15 @@ def review_files(
             if suggestions is not None and isinstance(patch, str) and patch:
                 try:
                     proposals = agent.suggest_changes(path, result, added_lines(patch))
-                    suggestions.extend(validate_suggestions(project_root, path, patch, proposals))
+                    accepted = validate_suggestions(project_root, path, patch, proposals)
+                    suggestions.extend(accepted)
+                    if flow_trace is not None:
+                        flow_trace.add(
+                            "수정안 검증", "Agent", "GitHub Actions",
+                            f"제안 {len(proposals)}개; 대상 {path}",
+                            f"유효한 제안 {len(accepted)}개",
+                            "PR diff와 실제 파일 줄을 대조하고 Python 문법 검사",
+                        )
                 except (OSError, UnicodeError, ValueError, TypeError, RuntimeError, OpenAIError):
                     print(f"{title}: 수정 제안을 생성하지 못했습니다.")
             trace = agent.last_review_trace
@@ -193,6 +203,16 @@ def review_files(
 
 
 def main() -> None:
+    flow_trace = FlowTrace()
+    output_path = os.environ.get("REVIEW_FLOW_OUTPUT")
+    try:
+        _run_review(flow_trace)
+    finally:
+        if output_path:
+            flow_trace.write_html(Path(output_path))
+
+
+def _run_review(flow_trace: FlowTrace) -> None:
     repository = os.environ["GITHUB_REPOSITORY"]
     number = int(os.environ["PR_NUMBER"])
     if number < 1:
@@ -201,22 +221,52 @@ def main() -> None:
     reflection_rounds = int(os.environ.get("REFLECTION_ROUNDS", "1"))
     if not 0 <= reflection_rounds <= 3:
         raise ValueError("REFLECTION_ROUNDS는 0~3이어야 합니다.")
+    flow_trace.add(
+        "PR 이벤트", "GitHub", "GitHub Actions",
+        f"저장소 {repository}; PR #{number}",
+        f"HEAD {os.environ.get('PR_HEAD_SHA', '미지정')[:12]}",
+        "pull_request opened, synchronize 또는 reopened 이벤트로 실행",
+    )
     github = GitHubClient(os.environ["GITHUB_TOKEN"], repository)
     changes = github.python_changes(number)
     paths = [item["filename"] for item in changes]
+    diff_lines = [
+        f"{item['filename']}: {line[:200]}"
+        for item in changes
+        for line in str(item.get("patch", "")).splitlines()
+        if line.startswith("+") and not line.startswith("+++")
+    ][:8]
+    flow_trace.add(
+        "변경 파일 선별", "GitHub API", "Agent",
+        f"PR #{number} 변경 파일 API 응답",
+        f"Python 파일 {len(paths)}개: {', '.join(paths)}\n변경 줄 예시:\n" + "\n".join(diff_lines),
+        "삭제 파일 제외, .py 파일만 최대 5개 선택",
+    )
     if not paths:
         print("변경된 Python 파일이 없습니다.")
         return
-    agent = CodeReviewAgent(project_root=str(project_root))
+    agent = CodeReviewAgent(project_root=str(project_root), flow_trace=flow_trace)
     suggestions = []
     github.upsert_comment(
         number, review_files(
             paths, project_root, agent, reflection_rounds,
             {item["filename"]: item.get("patch", "") for item in changes},
             suggestions,
+            flow_trace,
         )
     )
+    flow_trace.add(
+        "리뷰 댓글 등록", "GitHub Actions", "PR Conversation",
+        f"최종 리뷰 {len(paths)}개 파일", "기존 봇 댓글 갱신 또는 새 댓글 작성",
+        "최종 리뷰와 접힌 자기 비판 과정을 PR 일반 댓글에 표시",
+    )
     github.post_suggestions(number, os.environ["PR_HEAD_SHA"], suggestions)
+    flow_trace.add(
+        "코드 수정 제안 게시", "GitHub Actions", "PR Files changed",
+        f"검증된 한 줄 수정안 {len(suggestions)}개",
+        "Suggested change 리뷰 댓글 게시를 시도함",
+        "수정안은 사람이 Commit suggestion을 눌러야 적용됨",
+    )
     print(f"Python 파일 {len(paths)}개 리뷰 댓글을 등록하거나 갱신했습니다.")
 
 

@@ -3,6 +3,7 @@ from types import SimpleNamespace
 from unittest.mock import Mock
 
 from code_review_agent.agent.reviewer import CodeReviewAgent
+from code_review_agent.replay.trace import FlowTrace
 
 
 def test_agent_loop():
@@ -72,7 +73,8 @@ def test_reflection_creates_feedback_and_final_review():
     ]
     client = Mock()
     client.responses.create.side_effect = responses
-    agent = CodeReviewAgent(str(project_root), client=client)
+    flow_trace = FlowTrace()
+    agent = CodeReviewAgent(str(project_root), client=client, flow_trace=flow_trace)
 
     assert agent.review("calculator.py") == "수정된 리뷰"
     assert client.responses.create.call_count == 4
@@ -81,6 +83,14 @@ def test_reflection_creates_feedback_and_final_review():
     assert agent.last_review_trace.draft == "초안"
     assert agent.last_review_trace.feedback == ("근거를 보강하세요",)
     assert agent.last_review_trace.final == "수정된 리뷰"
+    titles = [event["title"] for event in flow_trace.events]
+    assert "리뷰 프롬프트 전달" in titles
+    assert "도구 호출" in titles
+    assert "도구 결과" in titles
+    assert "리뷰 초안" in titles
+    assert "자기 비판" in titles
+    assert "리뷰 수정" in titles
+    assert titles[-1] == "최종 리뷰 확정"
 
 
 def test_reflection_rounds_are_configurable():
